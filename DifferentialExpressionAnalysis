@@ -1,0 +1,697 @@
+################################################################################
+# R WORKFLOW: DESeq2 + GO/KEGG Enrichment (clusterProfiler)
+# Cleaned + extended:
+# - Adds Other_Name from GOA to all DE Excel outputs
+# - Robust parsing of CTA / ORF identifiers
+#modified for SCFA Ca Project
+################################################################################
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(clusterProfiler)
+  library(enrichplot)
+  library(ggplot2)
+  library(writexl)
+  library(stringr)
+  library(dplyr)
+  library(GO.db)
+  library(apeglm)
+  library(ComplexUpset)
+  library(tibble)
+  library(tidyr)
+})
+
+################################################################################
+# X) PLOTTING UTILITIES
+################################################################################
+
+make_volcano_df <- function(res_test, res_shr) {
+  data.frame(
+    gene = rownames(res_test),
+    log2FC = res_shr$log2FoldChange,
+    padj   = res_test$padj,
+    stringsAsFactors = FALSE
+  ) %>%
+    filter(!is.na(padj), !is.na(log2FC))
+}
+
+plot_volcano <- function(df, alpha, lfc_cutoff, title) {
+  
+  df$significance <- "NS"
+  df$significance[df$padj < alpha & df$log2FC >  lfc_cutoff] <- "Up"
+  df$significance[df$padj < alpha & df$log2FC < -lfc_cutoff] <- "Down"
+  
+  ggplot(df, aes(log2FC, -log10(padj), color = significance)) +
+    geom_point(alpha = 0.6, size = 1.5) +
+    scale_color_manual(values = c(
+      Down = "#2C7BB6",
+      Up   = "#D7191C",
+      NS   = "grey70"
+    )) +
+    geom_vline(xintercept = c(-lfc_cutoff, lfc_cutoff), linetype = "dashed") +
+    geom_hline(yintercept = -log10(alpha), linetype = "dashed") +
+    labs(
+      title = title,
+      x = "Log2 Fold Change",
+      y = "-log10 adjusted p-value",
+      color = "Regulation"
+    ) +
+    theme_bw() +
+    theme(text = element_text(size = 13))
+}
+
+################################################################################
+# 0) PATHS + PARAMETERS
+
+base_dir <- "/Users/suzettepalmer/Desktop/RNA-seq-Animesh-SCFADec2025/"
+
+counts_file <- file.path(base_dir, "SCFA_candida_gene_counts.txt")
+goa_file    <- file.path(base_dir, "22024.C_albicans_SC5314.goa")
+
+alpha            <- 0.05
+lfc_cutoff       <- 1.0
+min_genes_enrich <- 5
+min_count        <- 10
+min_samples      <- 2
+
+################################################################################
+# 1) LOAD COUNTS + METADATA
+################################################################################
+
+counts <- read.delim(counts_file, comment.char = "#", stringsAsFactors = FALSE)
+rownames(counts) <- counts$Geneid
+counts <- counts[, -(1:6), drop = FALSE]
+
+sample_info <- data.frame(
+  SampleName = colnames(counts),
+  Group = factor(rep(c("N", "A", "P", "B"), each = 4),
+                 levels = c("N", "A", "P", "B"))
+)
+
+rownames(sample_info) <- sample_info$SampleName
+
+stopifnot(identical(colnames(counts), rownames(sample_info)))
+write.csv(sample_info, file.path(base_dir, "SCFA_metadata.csv"))
+
+################################################################################
+# 2) DESEQ2
+################################################################################
+
+dds <- DESeqDataSetFromMatrix(
+  countData = counts,
+  colData   = sample_info,
+  design    = ~ Group
+)
+keep <- rowSums(counts(dds) >= min_count) >= min_samples
+dds <- dds[keep, ]
+
+dds$Group <- relevel(factor(dds$Group), ref = "N")
+
+dds <- DESeq(dds)  
+
+
+
+################################################################################
+# 3) PCA
+################################################################################
+
+pca_plot <- function(dds_table, title = NULL, palette = NULL, point_size = 4) {
+  vsd <- vst(dds_table, blind = FALSE)
+  pca_df <- plotPCA(vsd, intgroup = "Group", returnData = TRUE)
+  percentVar <- round(100 * attr(pca_df, "percentVar"))
+  
+  # Make a palette that matches the groups present in this dds_table
+  groups_present <- levels(droplevels(colData(dds_table)$Group))
+  if (is.null(palette)) {
+    palette <- palette_12
+  }
+  pal_use <- setNames(palette[seq_along(groups_present)], groups_present)
+  
+  ggplot(pca_df, aes(PC1, PC2, color = Group)) +
+    geom_point(size = point_size) +
+    scale_color_manual(values = pal_use, drop = TRUE) +
+    xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+    ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+    labs(title = title) +
+    theme_bw() +
+    theme(
+      text = element_text(size = 14),
+      legend.title = element_text(size = 12),
+      legend.text  = element_text(size = 10)
+    )
+}
+
+# Your palette (unchanged)
+palette_12 <- c(
+  "#FF0000", "#00AEEF", "#00C853", "#FFD600",
+  "#9C27B0", "#FF6F00", "#795548", "#1A237E",
+  "#C2185B", "#7CB342", "#00ACC1", "#424242"
+)
+
+# --- Build plots for all 3 dds tables ---
+# Replace these names with whatever you actually called them:
+# dds      = all samples
+# dds_aer  = aerobic-only
+# dds_an   = anaerobic-only
+
+# --- PCA plots ---
+p_pca_all <- pca_plot(dds,     title = "PCA: SCFA",       palette = palette_12)
+
+
+# --- Save separately ---
+pdf(file.path(base_dir, "PCA_SCFA_DESeq2_all.pdf"), width = 7, height = 6)
+print(p_pca_all)
+dev.off()
+
+
+
+################################################################################
+# 4) RESULTS + LFC SHRINKAGE
+################################################################################
+
+shrink_one <- function(dds, coef_name) {
+  if (requireNamespace("apeglm", quietly = TRUE)) {
+    lfcShrink(dds, coef = coef_name, type = "apeglm")
+  } else {
+    results(dds, name = coef_name)
+  }
+}
+
+# Results (you can keep your contrast style if you want)
+res <- list(
+  A_vs_N  = results(dds, contrast = c("Group","A","N")),
+  B_vs_N   = results(dds, contrast = c("Group","B","N")),
+  P_vs_N   = results(dds, contrast = c("Group","P","N"))
+)
+
+
+# Shrinkage: now the coef names match the *correct* reference in each model
+res_shrink <- list(
+  shr_A_vs_N  = shrink_one(dds, "Group_A_vs_N"),
+  shr_B_vs_N   = shrink_one(dds, "Group_B_vs_N"),
+  shr_P_vs_N   = shrink_one(dds, "Group_P_vs_N")
+)
+
+
+################################################################################
+# 4b) PARSE GOA → Other_Name MAP
+################################################################################
+
+parse_goa_other_names <- function(goa_file,
+                                  gene_regex = "CAALFM_[A-Z0-9]+") {
+  
+  goa <- read.delim(goa_file, comment.char = "!", header = FALSE)
+  colnames(goa) <- c(
+    "DB","ID","Symbol","Qual","GO_ID","Ref","Evid","With",
+    "Aspect","Name","Syn","Type","Taxon","Date",
+    "Assigned","Ext","Form"
+  )
+  
+  goa %>%
+    dplyr::mutate(
+      gene = stringr::str_extract(Syn, gene_regex),
+      syn_split = stringr::str_split(Syn, "\\|"),
+      Other_Name = dplyr::case_when(
+        lengths(syn_split) >= 3 ~ sapply(syn_split, `[`, 1),
+        lengths(syn_split) == 2 ~ sapply(syn_split, `[`, 2),
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    dplyr::filter(!is.na(gene)) %>%
+    dplyr::select(gene, Other_Name) %>%
+    dplyr::distinct()
+}
+
+gene_id_map <- parse_goa_other_names(goa_file)
+
+################################################################################
+# 4c) EXPORT FULL DESEQ2 RESULTS (WITH Other_Name)
+################################################################################
+
+write_xlsx(
+  lapply(c(res, res_shrink), function(x) {
+    
+    df <- as.data.frame(x)
+    df$gene <- rownames(df)
+    rownames(df) <- NULL
+    
+    df %>%
+      left_join(gene_id_map, by = "gene") %>%
+      relocate(Other_Name, .after = gene)
+  }),
+  file.path(base_dir, "DESeq2_results.xlsx")
+)
+
+################################################################################
+# 5) SIGNIFICANT GENES
+################################################################################
+
+get_sig <- function(res, res_shr) {
+  keep <- !is.na(res$padj) &
+    res$padj < alpha &
+    abs(res_shr$log2FoldChange) > lfc_cutoff
+  res_shr[keep, ]
+}
+
+sig_list <- 
+  # aerobic comparisons (reference = DMSO)
+  list(
+    B_vs_N  = get_sig(res$B_vs_N,  res_shrink$shr_B_vs_N),
+    P_vs_N   = get_sig(res$P_vs_N,   res_shrink$shr_P_vs_N),
+    A_vs_N   = get_sig(res$A_vs_N,   res_shrink$shr_A_vs_N)
+  )
+
+
+
+################################################################################
+# 6) DIRECTIONAL COMPARISON
+################################################################################
+
+compare_regulated_genes <- function(sig_list, direction = c("down", "up")) {
+  direction <- match.arg(direction)
+  
+  # 1) filter each df to up/down genes
+  regulated <- lapply(sig_list, function(df) {
+    if (direction == "down") df[df$log2FoldChange < 0, , drop = FALSE]
+    else df[df$log2FoldChange > 0, , drop = FALSE]
+  })
+  
+  # 2) gene sets as character vectors (rownames are assumed to be gene IDs)
+  gene_sets <- lapply(regulated, rownames)
+  groups <- names(gene_sets)
+  
+  # 3) all genes seen in any group
+  genes_union <- sort(unique(unlist(gene_sets, use.names = FALSE)))
+  
+  # 4) membership matrix: rows=genes, cols=groups, TRUE if gene in that group
+  mem <- sapply(gene_sets, function(gs) genes_union %in% gs)
+  rownames(mem) <- genes_union
+  
+  # 5) encode each gene's membership pattern (e.g., "YPD_vs_DMSO&LA_vs_DMSO")
+  pattern_label <- apply(mem, 1, function(x) {
+    present <- groups[which(x)]
+    paste(present, collapse = "&")
+  })
+  
+  # 6) genes split by exact pattern
+  genes_by_pattern <- split(genes_union, pattern_label)
+  
+  # 7) convenience objects similar to your originals
+  genes_all <- genes_by_pattern[[paste(groups, collapse = "&")]]
+  if (is.null(genes_all)) genes_all <- character(0)
+  
+  genes_unique <- setNames(
+    lapply(groups, function(g) {
+      key <- g
+      if (!is.null(genes_by_pattern[[key]])) genes_by_pattern[[key]] else character(0)
+    }),
+    paste0(groups, "_only")
+  )
+  
+  # 8) "exactly k groups" overlaps (k=1..length(groups))
+  k <- rowSums(mem)
+  genes_exactly_k <- setNames(
+    lapply(1:length(groups), function(kk) rownames(mem)[k == kk]),
+    paste0("in_exactly_", 1:length(groups), "_groups")
+  )
+  
+  # 9) summary table for every pattern
+  summary_patterns <- data.frame(
+    Pattern = names(genes_by_pattern),
+    Count   = lengths(genes_by_pattern),
+    stringsAsFactors = FALSE
+  )
+  summary_patterns <- summary_patterns[order(-summary_patterns$Count), , drop = FALSE]
+  
+  list(
+    regulated        = regulated,
+    gene_sets        = gene_sets,
+    genes_all        = genes_all,
+    genes_unique     = genes_unique,
+    genes_exactly_k  = genes_exactly_k,
+    genes_by_pattern = genes_by_pattern,
+    membership       = mem,
+    summary_patterns = summary_patterns
+  )
+}
+
+down_results <- compare_regulated_genes(sig_list, "down")
+up_results   <- compare_regulated_genes(sig_list, "up")
+
+####UPSET PLOTS
+make_upset_from_compare_results <- function(
+    results_obj,
+    pdf_file,
+    pattern_col = "Pattern",
+    count_col   = "Count",
+    sep         = "&",
+    width       = 9,
+    height      = 6,
+    ...
+) {
+  stopifnot(!is.null(results_obj$summary_patterns))
+  
+  df <- results_obj$summary_patterns %>%
+    tibble::as_tibble() %>%
+    dplyr::mutate(
+      !!pattern_col := as.character(.data[[pattern_col]]),
+      !!count_col   := as.integer(.data[[count_col]])
+    ) %>%
+    dplyr::group_by(.data[[pattern_col]]) %>%
+    dplyr::summarise(!!count_col := sum(.data[[count_col]]), .groups = "drop")
+  
+  sets <- df %>%
+    tidyr::separate_rows(!!rlang::sym(pattern_col), sep = sep) %>%
+    dplyr::distinct(.data[[pattern_col]]) %>%
+    dplyr::pull(.data[[pattern_col]])
+  
+  if (length(sets) == 0) stop("No sets found after splitting Pattern.")
+  if (nrow(df) == 0) stop("summary_patterns has 0 rows after processing.")
+  
+  upset_df <- df %>%
+    dplyr::mutate(
+      row_id = dplyr::row_number(),
+      tmp = .data[[pattern_col]]
+    ) %>%
+    tidyr::separate_rows(tmp, sep = sep) %>%
+    dplyr::mutate(value = 1L) %>%
+    tidyr::pivot_wider(
+      id_cols     = c(row_id, !!rlang::sym(count_col)),
+      names_from  = tmp,
+      values_from = value,
+      values_fill = 0L,
+      values_fn   = max
+    )
+  
+  expanded_mat <- upset_df %>%
+    tidyr::uncount(weights = .data[[count_col]]) %>%
+    dplyr::select(dplyr::all_of(sets)) %>%
+    dplyr::mutate(dplyr::across(dplyr::everything(), as.integer)) %>%
+    as.data.frame()
+  
+  if (nrow(expanded_mat) == 0) {
+    stop("expanded_mat has 0 rows after uncount(). Counts may all be 0 or missing.")
+  }
+  
+  grDevices::pdf(pdf_file, width = width, height = height, onefile = TRUE)
+  on.exit(grDevices::dev.off(), add = TRUE)
+  
+  p <- UpSetR::upset(
+    expanded_mat,
+    sets = sets,
+    keep.order = TRUE,
+    order.by = "freq",
+    ...
+  )
+  
+  # IMPORTANT: forces rendering to the PDF device in non-interactive contexts
+  print(p)
+  
+  invisible(list(df = df, sets = sets, expanded_mat = expanded_mat, pdf_file = pdf_file))
+}
+
+make_upset_from_compare_results(down_results, file.path(base_dir, "upset_down_aerobic.pdf"))
+make_upset_from_compare_results(up_results,   file.path(base_dir, "upset_up_aerobic.pdf"))
+
+################################################################################
+# 7) EXPORT REGULATED GENE SETS (WITH Other_Name)
+################################################################################
+export_regulated_results_to_excel <- function(results_obj, outfile, max_sheetname = 31) {
+  
+  sheets <- list()
+  
+  # Helper: make Excel-safe sheet names (<=31 chars; remove forbidden chars)
+  sanitize_sheet_name <- function(x) {
+    x <- gsub("[:\\\\/\\?\\*\\[\\]]", "_", x)   # forbidden in Excel
+    x <- gsub("&", "_AND_", x, fixed = TRUE)    # optional: avoid ampersand
+    if (nchar(x) > max_sheetname) x <- substr(x, 1, max_sheetname)
+    x
+  }
+  
+  # --- 1) per-comparison regulated tables (with gene + Other_Name) ---
+  for (nm in names(results_obj$regulated)) {
+    df <- results_obj$regulated[[nm]]
+    if (!is.null(df) && nrow(df) > 0) {
+      df_out <- as.data.frame(df)
+      df_out$gene <- rownames(df_out)
+      rownames(df_out) <- NULL
+      
+      sheet_nm <- paste0("regulated_", nm)
+      sheet_nm <- sanitize_sheet_name(sheet_nm)
+      
+      sheets[[sheet_nm]] <- df_out %>%
+        dplyr::left_join(gene_id_map, by = "gene") %>%
+        dplyr::relocate(Other_Name, .after = gene)
+    }
+  }
+  
+  # --- 2) exact overlap patterns (the main thing you asked for) ---
+  if (!is.null(results_obj$genes_by_pattern) && length(results_obj$genes_by_pattern) > 0) {
+    
+    for (pat in names(results_obj$genes_by_pattern)) {
+      genes <- results_obj$genes_by_pattern[[pat]]
+      if (length(genes) > 0) {
+        sheet_nm <- paste0("pattern_", pat)
+        sheet_nm <- sanitize_sheet_name(sheet_nm)
+        
+        # If truncation causes duplicates, append a unique suffix
+        if (sheet_nm %in% names(sheets)) {
+          suffix <- sprintf("_%02d", sum(startsWith(names(sheets), sheet_nm)) + 1)
+          sheet_nm <- sanitize_sheet_name(paste0(sheet_nm, suffix))
+        }
+        
+        sheets[[sheet_nm]] <- data.frame(gene = genes, stringsAsFactors = FALSE) %>%
+          dplyr::left_join(gene_id_map, by = "gene") %>%
+          dplyr::relocate(Other_Name, .after = gene)
+      }
+    }
+  }
+  
+  # --- 3) optional: genes in exactly k groups (k=1..N) ---
+  if (!is.null(results_obj$genes_exactly_k) && length(results_obj$genes_exactly_k) > 0) {
+    for (nm in names(results_obj$genes_exactly_k)) {
+      genes <- results_obj$genes_exactly_k[[nm]]
+      if (length(genes) > 0) {
+        sheet_nm <- sanitize_sheet_name(nm)
+        sheets[[sheet_nm]] <- data.frame(gene = genes, stringsAsFactors = FALSE) %>%
+          dplyr::left_join(gene_id_map, by = "gene") %>%
+          dplyr::relocate(Other_Name, .after = gene)
+      }
+    }
+  }
+  
+  # --- 4) keep your shared_all convenience sheet if present ---
+  if (!is.null(results_obj$genes_all) && length(results_obj$genes_all) > 0) {
+    sheets[["shared_all"]] <- data.frame(gene = results_obj$genes_all, stringsAsFactors = FALSE) %>%
+      dplyr::left_join(gene_id_map, by = "gene") %>%
+      dplyr::relocate(Other_Name, .after = gene)
+  }
+  
+  # --- 5) summaries ---
+  if (!is.null(results_obj$summary_patterns)) {
+    sheets[["summary_patterns"]] <- results_obj$summary_patterns
+  } else if (!is.null(results_obj$summary)) {
+    # fallback if you're still carrying the older summary
+    sheets[["summary"]] <- results_obj$summary
+  }
+  
+  # Drop empty sheets (safety)
+  sheets <- sheets[vapply(sheets, nrow, integer(1)) > 0]
+  
+  writexl::write_xlsx(sheets, outfile)
+}
+
+export_regulated_results_to_excel(
+  down_results,
+  file.path(base_dir, "Downregulated_gene_sets.xlsx")
+)
+
+export_regulated_results_to_excel(
+  up_results,
+  file.path(base_dir, "Upregulated_gene_sets.xlsx")
+)
+
+
+
+################################################################################
+#7 GOA PARSING -> TERM2GENE (BP + MF SEPARATE)
+################################################################################
+
+parse_goa_term2gene <- function(goa_file, aspect,
+                                regex = "CAALFM_[A-Z0-9]+") {
+  
+  goa <- read.delim(goa_file, comment.char = "!", header = FALSE)
+  colnames(goa) <- c(
+    "DB","ID","Symbol","Qual","GO_ID","Ref","Evid","With",
+    "Aspect","Name","Syn","Type","Taxon","Date",
+    "Assigned","Ext","Form"
+  )
+  
+  goa %>%
+    dplyr::mutate(gene = stringr::str_extract(Syn, regex)) %>%
+    dplyr::filter(!is.na(gene), Aspect == aspect) %>%
+    dplyr::select(GO_ID, gene) %>%
+    dplyr::distinct()
+}
+
+# Biological Process
+TERM2GENE_BP <- parse_goa_term2gene(goa_file, aspect = "P")
+
+# Molecular Function
+TERM2GENE_MF <- parse_goa_term2gene(goa_file, aspect = "F")
+
+# Shared TERM2NAME
+TERM2NAME <- data.frame(
+  GO_ID = keys(GO.db, keytype = "GOID"),
+  Term  = Term(GOTERM[keys(GO.db, keytype = "GOID")]),
+  stringsAsFactors = FALSE
+)
+
+universe_genes <- rownames(dds)
+
+################################################################################
+# 8) GO + KEGG ENRICHMENT (SINGLE LOOP, ALL SETS)
+################################################################################
+
+#add enrichment ratios
+add_enrichment_ratios <- function(ego_obj) {
+  if (is.null(ego_obj)) return(NULL)
+  
+  ego_df <- as.data.frame(ego_obj)
+  if (nrow(ego_df) == 0) return(ego_df)
+  
+  # parse "a/b"
+  num_ratio <- function(x) {
+    a <- as.numeric(sub("/.*", "", x))
+    b <- as.numeric(sub(".*/", "", x))
+    a / b
+  }
+  
+  ego_df$GeneRatio_num    <- num_ratio(ego_df$GeneRatio)
+  ego_df$BgRatio_num      <- num_ratio(ego_df$BgRatio)
+  ego_df$EnrichmentRatio  <- ego_df$GeneRatio_num / ego_df$BgRatio_num
+  
+  ego_df
+}
+
+enriched_gene <- function(genes, TERM2GENE) {
+  
+  genes <- intersect(unique(genes), universe_genes)
+  
+  # NEW: keep only genes present in TERM2GENE mapping
+  genes <- intersect(genes, unique(TERM2GENE$gene))
+  
+  if (length(genes) < min_genes_enrich) return(NULL)
+  
+  enricher(
+    gene          = genes,
+    universe      = intersect(universe_genes, unique(TERM2GENE$gene)), # optional but recommended
+    TERM2GENE     = TERM2GENE,
+    TERM2NAME     = TERM2NAME,
+    pvalueCutoff  = 0.1,
+    pAdjustMethod = "BH",
+    minGSSize     = 2,     # consider relaxing from default 10
+    maxGSSize     = 500
+  )
+}
+
+kegg_enrich <- function(genes) {
+  genes <- intersect(unique(genes), universe_genes)
+  if (length(genes) < min_genes_enrich) return(NULL)
+  
+  enrichKEGG(
+    gene          = genes,
+    universe      = universe_genes,
+    organism      = "cal",
+    pvalueCutoff  = 0.1,
+    pAdjustMethod = "BH"
+  )
+}
+
+################################################################################
+# GO (BP + MF) + KEGG ENRICHMENT
+################################################################################
+run_enrichment_for_patterns <- function(results_list,
+                                        direction,
+                                        pattern,
+                                        base_dir,
+                                        mode = c("individual", "genes_all"),
+                                        genes_all_name = "ALL3") {
+  
+  mode <- match.arg(mode)
+  
+  ## create output folder: base_dir/pattern/direction
+  out_dir <- file.path(base_dir, pattern, direction)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  ## Build gene sets to analyze
+  if (mode == "individual") {
+    gene_sets_in_dir <- lapply(results_list$regulated, rownames)  # named list by contrast
+  } else {
+    # genes_all is a character vector in your compare_regulated_genes() output
+    genes <- results_list$genes_all
+    if (is.null(genes)) stop("results_list$genes_all is NULL. Did compare_regulated_genes() create it?")
+    if (length(genes) == 0) stop("results_list$genes_all is empty (no shared genes across all conditions).")
+    
+    gene_sets_in_dir <- setNames(list(genes), genes_all_name)
+  }
+  
+  ## Loop over gene sets and run enrichment
+  for (nm in names(gene_sets_in_dir)) {
+    
+    genes <- gene_sets_in_dir[[nm]]
+    
+    ## ---- GO BIOLOGICAL PROCESS ----
+    ego_bp <- enriched_gene(genes, TERM2GENE_BP)
+    ego_bp_df <- add_enrichment_ratios(ego_bp)
+    
+    if (!is.null(ego_bp_df) && nrow(ego_bp_df) > 0) {
+      write.csv(
+        ego_bp_df,
+        file.path(out_dir, paste0("GO_BP_", direction, "_", nm, ".csv")),
+        row.names = FALSE
+      )
+    }
+    
+    ## ---- GO MOLECULAR FUNCTION ----
+    ego_mf <- enriched_gene(genes, TERM2GENE_MF)
+    ego_mf_df <- add_enrichment_ratios(ego_mf)
+    
+    if (!is.null(ego_mf_df) && nrow(ego_mf_df) > 0) {
+      write.csv(
+        ego_mf_df,
+        file.path(out_dir, paste0("GO_MF_", direction, "_", nm, ".csv")),
+        row.names = FALSE
+      )
+    }
+    
+    ## ---- KEGG ----
+    kegg <- kegg_enrich(genes)
+    kegg_df <- tryCatch(as.data.frame(kegg), error = function(e) NULL)
+    
+    if (!is.null(kegg_df) && nrow(kegg_df) > 0) {
+      out_file <- file.path(out_dir, paste0("KEGG_", direction, "_", nm, ".csv"))
+      write.csv(kegg_df, out_file, row.names = FALSE)
+      message("KEGG hits found for ", nm, " (", nrow(kegg_df), " terms)")
+    } else {
+      message("No KEGG hits for ", nm)
+    }
+  }
+  
+  invisible(NULL)
+}
+
+## ---- run for your 4 objects ----
+run_enrichment_for_patterns(down_results, "down", "aerobic", base_dir, mode = "individual")
+run_enrichment_for_patterns(up_results,   "up",   "aerobic", base_dir, mode = "individual")
+run_enrichment_for_patterns(down_results, "down", "aerobic", base_dir, mode = "genes_all", genes_all_name = "genes_all")
+run_enrichment_for_patterns(up_results,   "up",   "aerobic", base_dir, mode = "genes_all", genes_all_name = "genes_all")
+
+
+################################################################################
+# 9) REPRODUCIBILITY
+################################################################################
+
+writeLines(capture.output(sessionInfo()),
+           file.path(base_dir, "sessionInfo.txt"))
+
